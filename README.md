@@ -20,7 +20,7 @@
 
 ```bash
 # 克隆项目
-git clone https://github.com/YOUR_USERNAME/EdgeTTSPlayer.git
+git clone https://github.com/maifeipin/EdgeTTSPlayer.git
 cd EdgeTTSPlayer
 
 # 安装依赖
