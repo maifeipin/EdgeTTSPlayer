@@ -11,6 +11,7 @@ import webbrowser
 import re
 import tempfile
 import shutil
+import json
 from datetime import datetime
 
 import pygame
@@ -31,6 +32,12 @@ DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
 SENTENCE_DELIMITERS = re.compile(r'(?<=[。！？；…!?;])|(?<=\n)')
 CLAUSE_DELIMITERS = re.compile(r'(?<=[，、,])')
 
+# 播放历史文件
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.playback_history.json')
+
+# 高亮颜色
+HIGHLIGHT_BG = '#FFF3CD'       # 当前播放片段 - 浅黄色
+HIGHLIGHT_FG = '#856404'       # 当前播放片段 - 深棕色文字
 
 # 支持的文件格式
 SUPPORTED_FORMATS = [
@@ -57,7 +64,6 @@ def read_book_file(file_path):
     if ext in ('.html', '.htm'):
         html = path.read_text(encoding='utf-8')
         soup = BeautifulSoup(html, 'html.parser')
-        # 去掉 script/style 标签
         for tag in soup(['script', 'style']):
             tag.decompose()
         return soup.get_text(separator='\n', strip=True)
@@ -73,15 +79,12 @@ def read_book_file(file_path):
         return '\n'.join(texts)
 
     if ext == '.mobi':
-        # mobi 库需要先解包到临时目录
         tmp_dir = tempfile.mkdtemp(prefix='mobi_extract_')
         try:
             extracted_path, _ = mobi.extract(str(path), tmp_dir)
             extracted = pathlib.Path(extracted_path)
-            # 找到 html 文件
             html_files = list(extracted.rglob('*.html')) + list(extracted.rglob('*.htm'))
             if not html_files:
-                # 尝试直接读取提取出的文件
                 html_files = [extracted] if extracted.is_file() else []
             texts = []
             for hf in html_files:
@@ -113,21 +116,15 @@ def read_book_file(file_path):
         texts = [p.text for p in doc.paragraphs if p.text.strip()]
         return '\n'.join(texts)
 
-    # 兜底尝试按纯文本读取
     return path.read_text(encoding='utf-8')
 
 
 def split_text_to_chunks(text, max_length=200):
-    """按标点断句，将文本拆为不超过 max_length 的片段列表。
-
-    优先在句号等强分隔符断句，不够时在逗号等弱分隔符断，
-    最坏情况按 max_length 硬切。
-    """
+    """按标点断句，将文本拆为不超过 max_length 的片段列表。"""
     text = text.strip()
     if not text:
         return []
 
-    # 第一轮：按强分隔符拆分
     raw_sentences = SENTENCE_DELIMITERS.split(text)
     raw_sentences = [s for s in raw_sentences if s.strip()]
 
@@ -139,13 +136,10 @@ def split_text_to_chunks(text, max_length=200):
         if not sentence:
             continue
 
-        # 如果当前句子本身就超长，二次拆分
         if len(sentence) > max_length:
-            # 先把 buffer 里攒的内容提交
             if buffer:
                 chunks.append(buffer)
                 buffer = ""
-            # 按弱分隔符拆
             sub_parts = CLAUSE_DELIMITERS.split(sentence)
             sub_buf = ""
             for part in sub_parts:
@@ -157,7 +151,6 @@ def split_text_to_chunks(text, max_length=200):
                 else:
                     if sub_buf:
                         chunks.append(sub_buf)
-                    # 如果单个 part 仍然超长，硬切
                     while len(part) > max_length:
                         chunks.append(part[:max_length])
                         part = part[max_length:]
@@ -166,7 +159,6 @@ def split_text_to_chunks(text, max_length=200):
                 buffer = sub_buf
             continue
 
-        # 正常情况：尝试把句子追加到 buffer
         if len(buffer) + len(sentence) <= max_length:
             buffer += sentence
         else:
@@ -178,6 +170,40 @@ def split_text_to_chunks(text, max_length=200):
         chunks.append(buffer)
 
     return chunks
+
+
+def find_chunk_positions(full_text, chunks):
+    """将每个 chunk 映射回原文中的 (start, end) 字符偏移。
+
+    返回 list[(start, end)]，长度与 chunks 相同。
+    """
+    positions = []
+    search_start = 0
+
+    for chunk in chunks:
+        # 取 chunk 的前 30 个字符用于定位
+        needle = chunk[:min(30, len(chunk))]
+        pos = full_text.find(needle, search_start)
+
+        if pos == -1:
+            # 如果找不到（极少见），尝试从头搜索
+            pos = full_text.find(needle)
+        if pos == -1:
+            # 兜底：使用上一次的结束位置
+            pos = search_start
+
+        # 寻找 chunk 结束位置
+        end_needle = chunk[-min(30, len(chunk)):]
+        end_pos = full_text.find(end_needle, pos)
+        if end_pos != -1:
+            end_pos += len(end_needle)
+        else:
+            end_pos = pos + len(chunk)
+
+        positions.append((pos, min(end_pos, len(full_text))))
+        search_start = positions[-1][1]
+
+    return positions
 
 
 class Application(tk.Tk):
@@ -205,11 +231,16 @@ class Application(tk.Tk):
         # 断句设置
         self.chunk_size_var = tk.IntVar(value=200)
 
+        # 起始片段（1-based, 显示给用户的）
+        self.start_chunk_var = tk.IntVar(value=1)
+
         # 流式播放状态
         self._playback_stop = threading.Event()
         self._playback_thread = None
         self._temp_dir = None
         self._is_playing = False
+        self._current_chunk_index = 0  # 当前播放到的 chunk 索引 (0-based)
+        self._chunk_positions = []     # chunk 在原文中的位置映射
 
         # 初始化 pygame mixer
         pygame.mixer.init()
@@ -227,6 +258,7 @@ class Application(tk.Tk):
         self.style.configure('Stop.TButton', foreground='white', background='#f44336',
                              font=('微软雅黑', 11, 'bold'))
         self.style.map('Stop.TButton', background=[('active', '#d32f2f'), ('!active', '#f44336')])
+        self.style.configure('Small.TButton', font=('微软雅黑', 9), padding=2)
 
         self.init_ui()
         self.load_voices_async()
@@ -306,7 +338,6 @@ class Application(tk.Tk):
         voice_frame = ttk.LabelFrame(parent, text="语音设置", padding=10)
         voice_frame.pack(fill=tk.X, pady=(0, 10))
 
-        # 语音选择下拉框
         voice_sel_frame = ttk.Frame(voice_frame)
         voice_sel_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(voice_sel_frame, text="语音:").pack(side=tk.LEFT)
@@ -355,6 +386,9 @@ class Application(tk.Tk):
         self.text_preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.text_preview.bind('<<Modified>>', self.on_text_modified)
 
+        # 配置高亮标签
+        self.text_preview.tag_configure('playing', background=HIGHLIGHT_BG, foreground=HIGHLIGHT_FG)
+
         scrollbar.configure(command=self.text_preview.yview)
 
         convert_frame = ttk.Frame(parent)
@@ -381,11 +415,48 @@ class Application(tk.Tk):
         )
         self.btn_stop.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
 
+        # 起始位置选择
+        pos_frame = ttk.Frame(convert_frame)
+        pos_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Label(pos_frame, text="起始片段:", font=('微软雅黑', 9)).pack(side=tk.LEFT)
+        self.start_chunk_spin = ttk.Spinbox(
+            pos_frame, from_=1, to=99999, increment=1,
+            textvariable=self.start_chunk_var, width=6,
+            font=('微软雅黑', 9)
+        )
+        self.start_chunk_spin.pack(side=tk.LEFT, padx=(5, 5))
+
+        self.total_chunks_label = ttk.Label(pos_frame, text="", foreground='#999',
+                                            font=('微软雅黑', 9))
+        self.total_chunks_label.pack(side=tk.LEFT)
+
+        self.btn_resume = ttk.Button(
+            pos_frame, text="📌 从上次位置",
+            command=self._resume_from_history,
+            style='Small.TButton', width=14
+        )
+        self.btn_resume.pack(side=tk.RIGHT, padx=(5, 0))
+        self.btn_resume.state(['disabled'])
+
+        self.btn_reset_pos = ttk.Button(
+            pos_frame, text="⏮ 从头开始",
+            command=lambda: self.start_chunk_var.set(1),
+            style='Small.TButton', width=10
+        )
+        self.btn_reset_pos.pack(side=tk.RIGHT)
+
         # 播放状态
         self.play_status_var = tk.StringVar()
         self.play_status_label = ttk.Label(convert_frame, textvariable=self.play_status_var,
                                            foreground='#2196F3', font=('微软雅黑', 9))
         self.play_status_label.pack(fill=tk.X, pady=(0, 5))
+
+        # 历史提示
+        self.history_hint_var = tk.StringVar()
+        self.history_hint_label = ttk.Label(convert_frame, textvariable=self.history_hint_var,
+                                            foreground='#FF9800', font=('微软雅黑', 9))
+        self.history_hint_label.pack(fill=tk.X, pady=(0, 3))
 
         # 转换按钮
         self.btn_convert = ttk.Button(
@@ -423,10 +494,8 @@ class Application(tk.Tk):
                 voices = loop.run_until_complete(edge_tts.list_voices())
                 loop.close()
 
-                # 只保留中文语音，按 ShortName 排序
                 zh_voices = [v for v in voices if v["Locale"].startswith("zh-")]
                 zh_voices.sort(key=lambda v: v["ShortName"])
-
                 self.voices = zh_voices
 
                 display_names = []
@@ -442,7 +511,6 @@ class Application(tk.Tk):
         threading.Thread(target=_load, daemon=True).start()
 
     def _update_voice_ui(self, display_names):
-        """在主线程中更新语音下拉框"""
         self.voice_combo['values'] = display_names
         for i, v in enumerate(self.voices):
             if v["ShortName"] == DEFAULT_VOICE:
@@ -454,7 +522,6 @@ class Application(tk.Tk):
         self.status_var.set(f"准备就绪 — 已加载 {len(display_names)} 个中文语音")
 
     def get_selected_voice(self):
-        """获取当前选中的语音 ShortName"""
         idx = self.voice_combo.current()
         if 0 <= idx < len(self.voices):
             return self.voices[idx]["ShortName"]
@@ -463,7 +530,6 @@ class Application(tk.Tk):
     # ====================== 参数映射 ======================
 
     def get_rate_string(self):
-        """将滑块值 (1-100) 映射为 edge-tts 的 rate 参数字符串"""
         rate = self.rate_var.get()
         if rate <= 50:
             percent = int((rate - 50) / 50 * 50)
@@ -472,10 +538,90 @@ class Application(tk.Tk):
         return f"{percent:+d}%"
 
     def get_volume_string(self):
-        """将滑块值 (1-100) 映射为 edge-tts 的 volume 参数字符串"""
         volume = self.volume_var.get()
         percent = int((volume - 50) / 50 * 50)
         return f"{percent:+d}%"
+
+    # ====================== 播放历史持久化 ======================
+
+    def _load_all_history(self):
+        """加载全部播放历史"""
+        try:
+            if os.path.exists(HISTORY_FILE):
+                with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_all_history(self, history):
+        """保存全部播放历史"""
+        try:
+            with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _save_playback_position(self, file_path, chunk_index, total_chunks):
+        """保存当前文件的播放位置（chunk_index 为 0-based）"""
+        history = self._load_all_history()
+        key = os.path.abspath(file_path)
+        history[key] = {
+            'chunk_index': chunk_index,
+            'total_chunks': total_chunks,
+            'chunk_size': self.chunk_size_var.get(),
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M')
+        }
+        self._save_all_history(history)
+
+    def _load_playback_position(self, file_path):
+        """加载指定文件的上次播放位置，返回 dict 或 None"""
+        history = self._load_all_history()
+        key = os.path.abspath(file_path)
+        return history.get(key)
+
+    def _update_history_hint(self, file_path):
+        """更新界面上的历史提示信息"""
+        info = self._load_playback_position(file_path)
+        if info:
+            ci = info['chunk_index'] + 1  # 转为 1-based 显示
+            total = info['total_chunks']
+            ts = info.get('timestamp', '')
+            self.history_hint_var.set(f"📌 上次播放到 第{ci}/{total}片段  ({ts})")
+            self.start_chunk_var.set(ci)  # 自动设置起始位置
+            self.btn_resume.state(['!disabled'])
+        else:
+            self.history_hint_var.set("")
+            self.start_chunk_var.set(1)
+            self.btn_resume.state(['disabled'])
+
+    def _resume_from_history(self):
+        """从历史记录中恢复起始位置"""
+        file_path = self.file_path.get()
+        if file_path:
+            info = self._load_playback_position(file_path)
+            if info:
+                self.start_chunk_var.set(info['chunk_index'] + 1)
+                self.status_var.set(f"已设置起始位置: 第{info['chunk_index'] + 1}片段")
+
+    # ====================== 文本高亮 ======================
+
+    def _highlight_chunk(self, chunk_index):
+        """在主线程中高亮指定 chunk 对应的文本区域"""
+        def _do_highlight():
+            self._clear_highlight()
+            if chunk_index < len(self._chunk_positions):
+                start_pos, end_pos = self._chunk_positions[chunk_index]
+                start_idx = f"1.0 + {start_pos}c"
+                end_idx = f"1.0 + {end_pos}c"
+                self.text_preview.tag_add('playing', start_idx, end_idx)
+                # 自动滚动到高亮区域
+                self.text_preview.see(start_idx)
+        self.after(0, _do_highlight)
+
+    def _clear_highlight(self):
+        """清除所有高亮"""
+        self.text_preview.tag_remove('playing', '1.0', tk.END)
 
     # ====================== 文件操作 ======================
 
@@ -501,6 +647,8 @@ class Application(tk.Tk):
                 self.text_preview.delete(1.0, tk.END)
                 self.text_preview.insert(tk.END, content)
                 self.text_preview.edit_modified(False)
+                # 加载历史记录
+                self._update_history_hint(txt_file)
             except Exception as e:
                 messagebox.showwarning("警告", f"无法读取文件内容: {str(e)}")
 
@@ -543,7 +691,6 @@ class Application(tk.Tk):
             messagebox.showwarning("警告", "没有可播放的文本内容!")
             return
 
-        # 如果正在播放，先停止
         if self._is_playing:
             self.stop_playback()
 
@@ -553,26 +700,40 @@ class Application(tk.Tk):
             messagebox.showwarning("警告", "文本断句后为空!")
             return
 
+        # 计算 chunk 在原文中的位置（用于高亮）
+        self._chunk_positions = find_chunk_positions(text, chunks)
+
+        # 获取起始片段（1-based → 0-based）
+        start_index = max(0, self.start_chunk_var.get() - 1)
+        if start_index >= len(chunks):
+            start_index = 0
+            self.start_chunk_var.set(1)
+
+        # 更新起始片段 spinbox 的范围
+        total = len(chunks)
+        self.start_chunk_spin.configure(to=total)
+        self.total_chunks_label.configure(text=f"/ {total} 片段")
+
         # 创建临时目录
         self._temp_dir = tempfile.mkdtemp(prefix="tts_stream_")
         self._playback_stop.clear()
         self._is_playing = True
+        self._current_chunk_index = start_index
 
         # 更新 UI 状态
         self.btn_play.state(['disabled'])
         self.btn_stop.state(['!disabled'])
         self.btn_convert.state(['disabled'])
-        self.play_status_var.set(f"准备播放... 共 {len(chunks)} 个片段")
-        self.status_var.set(f"流式播放中 — 共 {len(chunks)} 个片段")
+        self.play_status_var.set(f"准备播放... 从第{start_index + 1}片段开始，共{total}片段")
+        self.status_var.set(f"流式播放中 — 共 {total} 个片段")
 
         voice = self.get_selected_voice()
         rate = self.get_rate_string()
         volume = self.get_volume_string()
 
-        # 启动后台播放线程
         self._playback_thread = threading.Thread(
             target=self._playback_worker,
-            args=(chunks, voice, rate, volume),
+            args=(chunks, voice, rate, volume, start_index),
             daemon=True
         )
         self._playback_thread.start()
@@ -581,50 +742,64 @@ class Application(tk.Tk):
         """停止播放并清理"""
         self._playback_stop.set()
 
-        # 停止当前正在播放的音频
         try:
             pygame.mixer.music.stop()
         except Exception:
             pass
 
-        # 等待线程结束
         if self._playback_thread and self._playback_thread.is_alive():
             self._playback_thread.join(timeout=3)
+
+        # 保存当前播放位置
+        file_path = self.file_path.get()
+        if file_path and self._current_chunk_index > 0:
+            total = len(self._chunk_positions) if self._chunk_positions else 0
+            if total > 0:
+                self._save_playback_position(file_path, self._current_chunk_index, total)
+                # 更新 UI 中的起始位置为下次续播位置
+                self.after(0, lambda: self.start_chunk_var.set(self._current_chunk_index + 1))
+                self.after(0, lambda: self._update_history_hint(file_path))
 
         self._cleanup_temp_dir()
         self._is_playing = False
 
-        # 恢复 UI
+        # 清除高亮、恢复 UI
+        self.after(0, self._clear_highlight)
         self.after(0, self._reset_play_ui)
 
     def _reset_play_ui(self):
-        """在主线程恢复播放按钮状态"""
         self.btn_play.state(['!disabled'])
         self.btn_stop.state(['disabled'])
         self.btn_convert.state(['!disabled'])
         self.play_status_var.set("")
 
-    def _playback_worker(self, chunks, voice, rate, volume):
-        """后台线程：双缓冲生成+播放碎片"""
+    def _playback_worker(self, chunks, voice, rate, volume, start_index=0):
+        """后台线程：双缓冲生成+播放碎片，从 start_index 开始"""
         loop = asyncio.new_event_loop()
         total = len(chunks)
         next_path = None
+        file_path = self.file_path.get()
 
         try:
             # 预生成第一个片段
             if self._playback_stop.is_set():
                 return
-            first_path = os.path.join(self._temp_dir, "chunk_0.mp3")
-            self.after(0, lambda: self.play_status_var.set(f"正在生成片段 1/{total}..."))
-            loop.run_until_complete(self._generate_chunk_audio(chunks[0], first_path, voice, rate, volume))
+            first_path = os.path.join(self._temp_dir, f"chunk_{start_index}.mp3")
+            self.after(0, lambda: self.play_status_var.set(
+                f"正在生成片段 {start_index + 1}/{total}..."
+            ))
+            loop.run_until_complete(
+                self._generate_chunk_audio(chunks[start_index], first_path, voice, rate, volume)
+            )
 
-            for i in range(total):
+            for i in range(start_index, total):
                 if self._playback_stop.is_set():
                     return
 
-                current_path = first_path if i == 0 else next_path
+                self._current_chunk_index = i
+                current_path = first_path if i == start_index else next_path
 
-                # 异步预生成下一个片段（如果还有的话）
+                # 异步预生成下一个片段
                 next_path = None
                 gen_thread = None
                 if i + 1 < total:
@@ -647,16 +822,20 @@ class Application(tk.Tk):
                     gen_thread = threading.Thread(target=_gen_next, daemon=True)
                     gen_thread.start()
 
-                # 播放当前片段
+                # 高亮当前片段
+                self._highlight_chunk(i)
+
+                # 更新播放状态
                 self.after(0, lambda idx=i: self.play_status_var.set(
                     f"▶ 正在播放 {idx + 1}/{total} 片段..."
                 ))
+                # 更新起始片段显示
+                self.after(0, lambda idx=i: self.start_chunk_var.set(idx + 1))
 
                 try:
                     pygame.mixer.music.load(current_path)
                     pygame.mixer.music.play()
 
-                    # 等待播放完成（轮询检查停止标志）
                     while pygame.mixer.music.get_busy():
                         if self._playback_stop.is_set():
                             pygame.mixer.music.stop()
@@ -666,7 +845,11 @@ class Application(tk.Tk):
                     self.after(0, lambda err=str(e): self.status_var.set(f"播放出错: {err}"))
                     return
 
-                # 删除已播放完的临时文件
+                # 播完一个 chunk，保存进度
+                if file_path:
+                    self._save_playback_position(file_path, i, total)
+
+                # 删除已播放的临时文件
                 try:
                     pygame.mixer.music.unload()
                     os.remove(current_path)
@@ -684,6 +867,11 @@ class Application(tk.Tk):
 
             # 播放完毕
             self.after(0, lambda: self.status_var.set("播放完毕"))
+            self.after(0, self._clear_highlight)
+            # 播完全部，重置起始位置为 1
+            if file_path:
+                self._save_playback_position(file_path, total - 1, total)
+            self.after(0, lambda: self.start_chunk_var.set(1))
 
         except Exception as e:
             self.after(0, lambda err=str(e): self.status_var.set(f"流式播放出错: {err}"))
@@ -692,14 +880,14 @@ class Application(tk.Tk):
             self._cleanup_temp_dir()
             self._is_playing = False
             self.after(0, self._reset_play_ui)
+            if file_path:
+                self.after(0, lambda: self._update_history_hint(file_path))
 
     async def _generate_chunk_audio(self, text, output_path, voice, rate, volume):
-        """调用 edge-tts 生成单个碎片音频"""
         communicate = edge_tts.Communicate(text, voice, rate=rate, volume=volume)
         await communicate.save(output_path)
 
     def _cleanup_temp_dir(self):
-        """清理临时目录"""
         if self._temp_dir and os.path.isdir(self._temp_dir):
             try:
                 shutil.rmtree(self._temp_dir, ignore_errors=True)
@@ -707,7 +895,7 @@ class Application(tk.Tk):
                 pass
             self._temp_dir = None
 
-    # ====================== 转换逻辑 (edge-tts) ======================
+    # ====================== 转换逻辑 ======================
 
     def convert_to_mp3(self):
         text = self.text_preview.get(1.0, tk.END).strip()
@@ -837,25 +1025,31 @@ class Application(tk.Tk):
         help_text = """文本转语音转换器使用说明（edge-tts 版）
 
 1. 基本使用:
-   - 点击"选择文件"按钮选择要转换的文本文件
+   - 点击"选择文件"加载文本/电子书/文档
+   - 支持格式: TXT, MD, HTML, EPUB, MOBI, PDF, DOCX
    - 在右侧预览区域可以查看和编辑内容（自动保存）
-   - 点击"转换为MP3"保存为文件
 
-2. 流式播放（推荐）:
+2. 流式播放:
    - 点击 ▶ 播放，文本自动断句并连续播放
-   - 播放时显示当前片段进度
-   - 点击 ■ 停止即可中断，临时文件自动清理
-   - "每片最大字数"控制每个片段的长度
+   - 播放时当前片段文字高亮显示
+   - 点击 ■ 停止即可中断，自动保存播放位置
 
-3. 语音设置:
+3. 播放位置记忆:
+   - 停止播放后自动记忆位置
+   - 下次打开同一文件自动恢复到上次位置
+   - "📌 从上次位置"按钮恢复到上次停止处
+   - "⏮ 从头开始"按钮重置到第1片段
+   - 也可手动输入起始片段编号
+
+4. 语音设置:
    - 语音: 从下拉框选择中文语音
-   - 语速: 滑块中间为正常语速
-   - 音量: 滑块中间为正常音量
+   - 语速/音量: 滑块中间为正常值
 
-4. 批量转换:
-   - 点击"批量转换"选择多个文本文件
+5. MP3导出:
+   - "转换为MP3"导出完整音频
+   - "批量转换"一次处理多个文件
 
-5. 注意事项:
+6. 注意事项:
    - 需要网络连接（Microsoft Edge 在线 TTS）
 """
         messagebox.showinfo("帮助", help_text)
