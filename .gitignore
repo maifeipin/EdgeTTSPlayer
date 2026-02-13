@@ -29,5 +29,14 @@ desktop.ini
 *.ico
 app_icon.ico
 
+# Test files / ebooks
+*.epub
+*.mobi
+*.pdf
+*.docx
+
+# Playback history
+.playback_history.json
+
 # PyInstaller
 *.spec
