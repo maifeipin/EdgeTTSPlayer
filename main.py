@@ -15,6 +15,14 @@ from datetime import datetime
 
 import pygame
 
+# 多格式解析
+from bs4 import BeautifulSoup
+import ebooklib
+from ebooklib import epub
+from PyPDF2 import PdfReader
+from docx import Document as DocxDocument
+import mobi
+
 
 # edge-tts 默认中文语音
 DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
@@ -22,6 +30,91 @@ DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
 # 断句标点
 SENTENCE_DELIMITERS = re.compile(r'(?<=[。！？；…!?;])|(?<=\n)')
 CLAUSE_DELIMITERS = re.compile(r'(?<=[，、,])')
+
+
+# 支持的文件格式
+SUPPORTED_FORMATS = [
+    ('所有支持格式', '*.txt *.md *.html *.htm *.epub *.mobi *.pdf *.docx'),
+    ('文本文件', '*.txt *.md'),
+    ('电子书', '*.epub *.mobi'),
+    ('文档', '*.pdf *.docx'),
+    ('网页', '*.html *.htm'),
+    ('所有文件', '*.*'),
+]
+
+
+def read_book_file(file_path):
+    """根据文件扩展名读取内容，返回纯文本。
+
+    支持: .txt .md .html .htm .epub .mobi .pdf .docx
+    """
+    path = pathlib.Path(file_path)
+    ext = path.suffix.lower()
+
+    if ext in ('.txt', '.md'):
+        return path.read_text(encoding='utf-8')
+
+    if ext in ('.html', '.htm'):
+        html = path.read_text(encoding='utf-8')
+        soup = BeautifulSoup(html, 'html.parser')
+        # 去掉 script/style 标签
+        for tag in soup(['script', 'style']):
+            tag.decompose()
+        return soup.get_text(separator='\n', strip=True)
+
+    if ext == '.epub':
+        book = epub.read_epub(str(path), options={'ignore_ncx': True})
+        texts = []
+        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+            soup = BeautifulSoup(item.get_content(), 'html.parser')
+            text = soup.get_text(separator='\n', strip=True)
+            if text:
+                texts.append(text)
+        return '\n'.join(texts)
+
+    if ext == '.mobi':
+        # mobi 库需要先解包到临时目录
+        tmp_dir = tempfile.mkdtemp(prefix='mobi_extract_')
+        try:
+            extracted_path, _ = mobi.extract(str(path), tmp_dir)
+            extracted = pathlib.Path(extracted_path)
+            # 找到 html 文件
+            html_files = list(extracted.rglob('*.html')) + list(extracted.rglob('*.htm'))
+            if not html_files:
+                # 尝试直接读取提取出的文件
+                html_files = [extracted] if extracted.is_file() else []
+            texts = []
+            for hf in html_files:
+                try:
+                    html = hf.read_text(encoding='utf-8', errors='ignore')
+                    soup = BeautifulSoup(html, 'html.parser')
+                    for tag in soup(['script', 'style']):
+                        tag.decompose()
+                    text = soup.get_text(separator='\n', strip=True)
+                    if text:
+                        texts.append(text)
+                except Exception:
+                    continue
+            return '\n'.join(texts)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if ext == '.pdf':
+        reader = PdfReader(str(path))
+        texts = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                texts.append(text)
+        return '\n'.join(texts)
+
+    if ext == '.docx':
+        doc = DocxDocument(str(path))
+        texts = [p.text for p in doc.paragraphs if p.text.strip()]
+        return '\n'.join(texts)
+
+    # 兜底尝试按纯文本读取
+    return path.read_text(encoding='utf-8')
 
 
 def split_text_to_chunks(text, max_length=200):
@@ -395,8 +488,8 @@ class Application(tk.Tk):
 
         txt_file = filedialog.askopenfilename(
             initialdir=initial_dir,
-            title="选择文本文件",
-            filetypes=(('文本文件', '*.txt'), ('所有文件', '*.*'))
+            title="选择文件",
+            filetypes=SUPPORTED_FORMATS
         )
         if txt_file:
             self.file_path.set(txt_file)
@@ -404,8 +497,7 @@ class Application(tk.Tk):
             self.output_dir.set(file_dir)
             self.status_var.set(f"已选择文件: {pathlib.Path(txt_file).name}")
             try:
-                with open(txt_file, 'r', encoding='utf8') as f:
-                    content = f.read()
+                content = read_book_file(txt_file)
                 self.text_preview.delete(1.0, tk.END)
                 self.text_preview.insert(tk.END, content)
                 self.text_preview.edit_modified(False)
@@ -662,8 +754,8 @@ class Application(tk.Tk):
     def batch_convert(self):
         files = filedialog.askopenfilenames(
             initialdir=os.path.dirname(self.file_path.get()) if self.file_path.get() else str(pathlib.Path.home()),
-            title="选择多个文本文件",
-            filetypes=(('文本文件', '*.txt'), ('所有文件', '*.*'))
+            title="选择多个文件",
+            filetypes=SUPPORTED_FORMATS
         )
         if not files:
             return
@@ -688,8 +780,7 @@ class Application(tk.Tk):
                     if not file_path:
                         continue
                     try:
-                        with open(file_path, 'r', encoding='utf8') as f:
-                            text = f.read().strip()
+                        text = read_book_file(file_path).strip()
                         if not text:
                             continue
 
