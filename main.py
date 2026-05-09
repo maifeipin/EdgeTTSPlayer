@@ -108,17 +108,37 @@ def read_book_file(file_path):
             if not item_text:
                 continue
             
-            # 提取标题：优先找 h1-h3，其次找 title 标签
-            title_tag = soup.find(['h1', 'h2', 'h3'])
-            if not title_tag:
-                title_tag = soup.find('title')
+            lines = [line.strip() for line in item_text.split('\n') if line.strip()]
             
-            title_text = title_tag.get_text().strip() if title_tag else ""
-            # 过滤掉一些无意义的标题，使用正文前40个字截取兜底，并清理多余空格
+            # 1. 尝试从 h1-h3 提取（合并前三个头，防止标题被拆分如 <h2>第一章</h2> <h2>惊蛰</h2>）
+            headers = soup.find_all(['h1', 'h2', 'h3'])
+            header_texts = [h.get_text().strip() for h in headers if h.get_text().strip()]
+            title_text = " ".join(header_texts[:3])
+            
+            # 2. 如果没有标题，尝试用 title 标签
+            if not title_text or len(title_text) > 100:
+                title_tag = soup.find('title')
+                title_text = title_tag.get_text().strip() if title_tag else ""
+                
+            # 3. 如果提取出来只有 "第N章" 等，尝试去正文找副标题
+            import re
+            is_simple_chapter = re.match(r'^第[零一二三四五六七八九十百千万\d]+[章节回卷部]$', title_text.strip())
+            if is_simple_chapter and lines:
+                # 往后找，寻找正文中第一章的下一行，考虑换行符和段落
+                for i in range(min(5, len(lines) - 1)):
+                    # 如果找到了这行，而且下一行不是很长，很可能就是具体的小标题
+                    if lines[i] == title_text.strip():
+                        if len(lines[i+1]) <= 20:
+                            title_text += " " + lines[i+1]
+                        break
+                        
+            # 4. 终极兜底策略：如果标题还是无效或空，截取正文
             if not title_text or len(title_text) > 100 or title_text.lower().startswith('unknown'):
-                import re
-                clean_text = re.sub(r'\s+', ' ', item_text[:100]).strip()
-                title_text = clean_text[:40] + "..."
+                if lines:
+                    fallback = " ".join(lines[:2])
+                    title_text = fallback[:40] + ("..." if len(fallback) > 40 else "")
+                else:
+                    title_text = f"章节 {len(chapters) + 1}"
             
             chapters.append((title_text, current_pos))
             texts.append(item_text)
@@ -518,7 +538,15 @@ class Application(tk.Tk):
             style='Stop.TButton',
             state='disabled'
         )
-        self.btn_stop.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 0))
+        self.btn_stop.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+
+        self.btn_save = ttk.Button(
+            play_frame,
+            text="💾 存进度",
+            command=self.manual_save_progress,
+            style='Accent.TButton'
+        )
+        self.btn_save.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # 播放状态
         self.play_status_var = tk.StringVar()
@@ -642,12 +670,27 @@ class Application(tk.Tk):
         """保存全局设置（如发音人、语速、音量）"""
         history = self._load_all_history()
         history['__GLOBAL_SETTINGS__'] = {
-            'voice': self.voice_combo.get() if self.voice_combo.get() else DEFAULT_VOICE,
+            'voice': self.get_selected_voice(),
             'rate': self.rate_var.get(),
             'volume': self.volume_var.get(),
             'chunk_size': self.chunk_size_var.get()
         }
         self._save_all_history(history)
+
+    def manual_save_progress(self):
+        """手动触发保存当前进度和全局设置"""
+        file_path = self.file_path.get()
+        if file_path and getattr(self, '_cached_chunks', None):
+            # 获取当前界面的片段号
+            idx = self.start_chunk_var.get() - 1
+            if idx < 0: idx = 0
+            total = len(self._cached_chunks)
+            if idx >= total: idx = total - 1
+            self._save_playback_position(file_path, idx, total)
+        else:
+            # 即使没打开文件，也保存一下全局设置
+            self._save_global_settings()
+        self.status_var.set("✅ 进度和设置已手动保存！")
 
     def _load_global_settings(self):
         """加载全局设置"""
@@ -792,7 +835,7 @@ class Application(tk.Tk):
                     try:
                         with open(meta_cache_path, 'r', encoding='utf-8') as f:
                             meta = json.load(f)
-                        if meta.get('chunk_size') == chunk_size:
+                        if meta.get('chunk_size') == chunk_size and meta.get('cache_version') == 2:
                             use_cache = True
                     except Exception:
                         pass
@@ -807,7 +850,7 @@ class Application(tk.Tk):
                     self.after(0, lambda: self._show_content(file_path, content, chapters))
                     self.after(0, lambda: self._on_chunks_ready(file_path, chunks, chunk_positions, chunk_size, True))
                 else:
-                    self.after(0, lambda: self.status_var.set(f"首次加载或设置已变，正在解析全书结构..."))
+                    self.after(0, lambda: self.status_var.set(f"首次加载或结构已更新，正在解析全书..."))
                     content, chapters = read_book_file(file_path)
                     
                     # 立即显示文本内容和章节
@@ -823,6 +866,7 @@ class Application(tk.Tk):
                             f.write(content)
                         with open(meta_cache_path, 'w', encoding='utf-8') as f:
                             json.dump({
+                                'cache_version': 2,
                                 'chunk_size': chunk_size,
                                 'chapters': chapters,
                                 'chunks': chunks,
