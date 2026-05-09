@@ -40,3 +40,6 @@ app_icon.ico
 
 # PyInstaller
 *.spec
+
+.book_cache/
+scratch/

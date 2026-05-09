@@ -13,8 +13,18 @@ import tempfile
 import shutil
 import json
 from datetime import datetime
+import hashlib
 
 import pygame
+
+# 缓存目录
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.book_cache')
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+def get_file_hash(file_path):
+    stat = os.stat(file_path)
+    key = f"{os.path.abspath(file_path)}_{stat.st_size}_{stat.st_mtime}"
+    return hashlib.md5(key.encode('utf-8')).hexdigest()
 
 # 多格式解析
 from bs4 import BeautifulSoup
@@ -51,34 +61,68 @@ SUPPORTED_FORMATS = [
 
 
 def read_book_file(file_path):
-    """根据文件扩展名读取内容，返回纯文本。
-
+    """根据文件扩展名读取内容，返回 (纯文本, 章节列表)。
+    
+    章节列表格式: [(标题, 起始字符偏移), ...] 或 None
     支持: .txt .md .html .htm .epub .mobi .pdf .docx
     """
     path = pathlib.Path(file_path)
     ext = path.suffix.lower()
+    text = ""
+    chapters = None
 
     if ext in ('.txt', '.md'):
-        return path.read_text(encoding='utf-8')
-
-    if ext in ('.html', '.htm'):
+        text = path.read_text(encoding='utf-8')
+    elif ext in ('.html', '.htm'):
         html = path.read_text(encoding='utf-8')
         soup = BeautifulSoup(html, 'html.parser')
         for tag in soup(['script', 'style']):
             tag.decompose()
-        return soup.get_text(separator='\n', strip=True)
-
-    if ext == '.epub':
-        book = epub.read_epub(str(path), options={'ignore_ncx': True})
+        text = soup.get_text(separator='\n', strip=True)
+    elif ext == '.epub':
+        book = epub.read_epub(str(path))
+        chapters = []
         texts = []
-        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-            soup = BeautifulSoup(item.get_content(), 'html.parser')
-            text = soup.get_text(separator='\n', strip=True)
-            if text:
-                texts.append(text)
-        return '\n'.join(texts)
+        current_pos = 0
+        
+        # 使用 spine 保证阅读顺序
+        spine_items = []
+        for item_id, _ in book.spine:
+            item = book.get_item_with_id(item_id)
+            if item and isinstance(item, ebooklib.epub.EpubHtml):
+                spine_items.append(item)
+                
+        if not spine_items:
+            # 兜底
+            spine_items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
 
-    if ext == '.mobi':
+        for item in spine_items:
+            content = item.get_content()
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # 清理无关标签
+            for tag in soup(['script', 'style']):
+                tag.decompose()
+                
+            item_text = soup.get_text(separator='\n', strip=True)
+            if not item_text:
+                continue
+            
+            # 提取标题：优先找 h1-h3，其次找 title 标签
+            title_tag = soup.find(['h1', 'h2', 'h3'])
+            if not title_tag:
+                title_tag = soup.find('title')
+            
+            title_text = title_tag.get_text().strip() if title_tag else ""
+            # 过滤掉一些无意义的标题，使用正文前15个字截取兜底
+            if not title_text or len(title_text) > 100 or title_text.lower().startswith('unknown'):
+                title_text = item_text[:15].replace('\n', ' ') + "..."
+            
+            chapters.append((title_text, current_pos))
+            texts.append(item_text)
+            current_pos += len(item_text) + 1 # +1 是因为后面用 \n join
+        text = '\n'.join(texts)
+    elif ext == '.mobi':
         tmp_dir = tempfile.mkdtemp(prefix='mobi_extract_')
         try:
             extracted_path, _ = mobi.extract(str(path), tmp_dir)
@@ -93,30 +137,30 @@ def read_book_file(file_path):
                     soup = BeautifulSoup(html, 'html.parser')
                     for tag in soup(['script', 'style']):
                         tag.decompose()
-                    text = soup.get_text(separator='\n', strip=True)
-                    if text:
-                        texts.append(text)
+                    t = soup.get_text(separator='\n', strip=True)
+                    if t:
+                        texts.append(t)
                 except Exception:
                     continue
-            return '\n'.join(texts)
+            text = '\n'.join(texts)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    if ext == '.pdf':
+    elif ext == '.pdf':
         reader = PdfReader(str(path))
         texts = []
         for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                texts.append(text)
-        return '\n'.join(texts)
-
-    if ext == '.docx':
+            t = page.extract_text()
+            if t:
+                texts.append(t)
+        text = '\n'.join(texts)
+    elif ext == '.docx':
         doc = DocxDocument(str(path))
         texts = [p.text for p in doc.paragraphs if p.text.strip()]
-        return '\n'.join(texts)
+        text = '\n'.join(texts)
+    else:
+        text = path.read_text(encoding='utf-8')
 
-    return path.read_text(encoding='utf-8')
+    return text, chapters
 
 
 def split_text_to_chunks(text, max_length=200):
@@ -181,20 +225,21 @@ def find_chunk_positions(full_text, chunks):
     search_start = 0
 
     for chunk in chunks:
-        # 取 chunk 的前 30 个字符用于定位
-        needle = chunk[:min(30, len(chunk))]
+        # 取 chunk 的前 20 个字符用于定位
+        needle = chunk[:min(20, len(chunk))]
         pos = full_text.find(needle, search_start)
 
         if pos == -1:
-            # 如果找不到（极少见），尝试从头搜索
-            pos = full_text.find(needle)
-        if pos == -1:
-            # 兜底：使用上一次的结束位置
-            pos = search_start
+            # 如果找不到，向后多找一段，或者向前回溯一点
+            fallback_start = max(0, search_start - 1000)
+            pos = full_text.find(needle, fallback_start, search_start + 10000)
+            if pos == -1:
+                pos = search_start
 
         # 寻找 chunk 结束位置
-        end_needle = chunk[-min(30, len(chunk)):]
-        end_pos = full_text.find(end_needle, pos)
+        end_needle = chunk[-min(20, len(chunk)):]
+        end_pos = full_text.find(end_needle, pos, pos + len(chunk) + 1000)
+        
         if end_pos != -1:
             end_pos += len(end_needle)
         else:
@@ -239,8 +284,12 @@ class Application(tk.Tk):
         self._playback_thread = None
         self._temp_dir = None
         self._is_playing = False
+        self._is_paused = False
         self._current_chunk_index = 0  # 当前播放到的 chunk 索引 (0-based)
         self._chunk_positions = []     # chunk 在原文中的位置映射
+        self._cached_chunks = []       # 当前缓存的片段列表
+        self._cached_chunk_size = 0    # 生成 _cached_chunks 时使用的 max_length
+        self.chapters = []             # EPUB 章节信息 [(title, start_index), ...]
 
         # 初始化 pygame mixer
         pygame.mixer.init()
@@ -262,9 +311,13 @@ class Application(tk.Tk):
 
         self.init_ui()
         self.load_voices_async()
+        self._load_global_settings()
 
         # 关闭窗口时清理
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 尝试恢复上次打开的文件
+        self.after(500, self._auto_load_last_file)
 
     def _on_close(self):
         """窗口关闭时停止播放并清理"""
@@ -378,11 +431,22 @@ class Application(tk.Tk):
         preview_frame = ttk.LabelFrame(parent, text="文本预览", padding=10)
         preview_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
-        scrollbar = ttk.Scrollbar(preview_frame, orient=tk.VERTICAL)
+        # 章节选择栏 (初始隐藏)
+        self.chapter_frame = ttk.Frame(preview_frame)
+        ttk.Label(self.chapter_frame, text="章节跳转:", font=('微软雅黑', 9)).pack(side=tk.LEFT, padx=(0, 5))
+        self.chapter_combo = ttk.Combobox(self.chapter_frame, state='readonly', font=('微软雅黑', 9))
+        self.chapter_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.chapter_combo.bind("<<ComboboxSelected>>", self.on_chapter_selected)
+
+        text_scroll_frame = ttk.Frame(preview_frame)
+        text_scroll_frame.pack(fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(text_scroll_frame, orient=tk.VERTICAL)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.text_preview = tk.Text(preview_frame, height=8, font=('微软雅黑', 10), wrap=tk.WORD,
+        self.text_preview = tk.Text(text_scroll_frame, height=8, font=('微软雅黑', 10), wrap=tk.WORD,
                                     yscrollcommand=scrollbar.set)
+        
         self.text_preview.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.text_preview.bind('<<Modified>>', self.on_text_modified)
 
@@ -394,28 +458,7 @@ class Application(tk.Tk):
         convert_frame = ttk.Frame(parent)
         convert_frame.pack(fill=tk.X, pady=(10, 0))
 
-        # 播放 / 停止按钮
-        play_frame = ttk.Frame(convert_frame)
-        play_frame.pack(fill=tk.X, pady=(0, 5))
-
-        self.btn_play = ttk.Button(
-            play_frame,
-            text="▶ 播放",
-            command=self.start_playback,
-            style='Accent.TButton'
-        )
-        self.btn_play.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-
-        self.btn_stop = ttk.Button(
-            play_frame,
-            text="■ 停止",
-            command=self.stop_playback,
-            style='Stop.TButton',
-            state='disabled'
-        )
-        self.btn_stop.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
-
-        # 起始位置选择
+        # 起始位置选择 (移动到上方)
         pos_frame = ttk.Frame(convert_frame)
         pos_frame.pack(fill=tk.X, pady=(0, 5))
 
@@ -426,6 +469,8 @@ class Application(tk.Tk):
             font=('微软雅黑', 9)
         )
         self.start_chunk_spin.pack(side=tk.LEFT, padx=(5, 5))
+        # 绑定手动修改起始片段的回调，用于更新章节联动
+        self.start_chunk_var.trace_add('write', self.on_start_chunk_changed)
 
         self.total_chunks_label = ttk.Label(pos_frame, text="", foreground='#999',
                                             font=('微软雅黑', 9))
@@ -445,6 +490,35 @@ class Application(tk.Tk):
             style='Small.TButton', width=10
         )
         self.btn_reset_pos.pack(side=tk.RIGHT)
+
+        # 播放 / 停止按钮 (移动到下方)
+        play_frame = ttk.Frame(convert_frame)
+        play_frame.pack(fill=tk.X, pady=(5, 5))
+
+        self.btn_play = ttk.Button(
+            play_frame,
+            text="▶ 播放",
+            command=self.start_playback,
+            style='Accent.TButton'
+        )
+        self.btn_play.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+
+        self.btn_pause = ttk.Button(
+            play_frame,
+            text="⏸ 暂停",
+            command=self.toggle_pause,
+            state='disabled'
+        )
+        self.btn_pause.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+
+        self.btn_stop = ttk.Button(
+            play_frame,
+            text="■ 停止",
+            command=self.stop_playback,
+            style='Stop.TButton',
+            state='disabled'
+        )
+        self.btn_stop.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 0))
 
         # 播放状态
         self.play_status_var = tk.StringVar()
@@ -562,22 +636,55 @@ class Application(tk.Tk):
         except Exception:
             pass
 
+    def _save_global_settings(self):
+        """保存全局设置（如发音人、语速、音量）"""
+        history = self._load_all_history()
+        history['__GLOBAL_SETTINGS__'] = {
+            'voice': self.voice_combo.get() if self.voice_combo.get() else DEFAULT_VOICE,
+            'rate': self.rate_var.get(),
+            'volume': self.volume_var.get(),
+            'chunk_size': self.chunk_size_var.get()
+        }
+        self._save_all_history(history)
+
+    def _load_global_settings(self):
+        """加载全局设置"""
+        history = self._load_all_history()
+        settings = history.get('__GLOBAL_SETTINGS__')
+        if settings:
+            voice_val = settings.get('voice', DEFAULT_VOICE)
+            # Ensure voice exists in combo values
+            if voice_val in self.voice_combo['values']:
+                self.voice_combo.set(voice_val)
+            self.rate_var.set(settings.get('rate', 50.00))
+            self.volume_var.set(settings.get('volume', 50.00))
+            self.chunk_size_var.set(settings.get('chunk_size', 200))
+            # Update labels
+            self.display_rate_var.set(self.get_rate_string())
+            self.display_volume_var.set(self.get_volume_string())
+
     def _save_playback_position(self, file_path, chunk_index, total_chunks):
         """保存当前文件的播放位置（chunk_index 为 0-based）"""
         history = self._load_all_history()
         key = os.path.abspath(file_path)
         history[key] = {
             'chunk_index': chunk_index,
+            'chapter_index': self.chapter_combo.current(),
             'total_chunks': total_chunks,
             'chunk_size': self.chunk_size_var.get(),
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M')
         }
+        history['__LAST_FILE__'] = key
         self._save_all_history(history)
+        self._save_global_settings()
 
     def _load_playback_position(self, file_path):
         """加载指定文件的上次播放位置，返回 dict 或 None"""
         history = self._load_all_history()
         key = os.path.abspath(file_path)
+        # 排除特殊键
+        if key == '__LAST_FILE__':
+            return None
         return history.get(key)
 
     def _update_history_hint(self, file_path):
@@ -603,6 +710,14 @@ class Application(tk.Tk):
             if info:
                 self.start_chunk_var.set(info['chunk_index'] + 1)
                 self.status_var.set(f"已设置起始位置: 第{info['chunk_index'] + 1}片段")
+
+    def _auto_load_last_file(self):
+        """启动时自动加载上次打开的文件"""
+        history = self._load_all_history()
+        last_file = history.get('__LAST_FILE__')
+        if last_file and os.path.exists(last_file):
+            self.status_var.set(f"正在自动恢复上次打开的文件...")
+            self.load_file(last_file)
 
     # ====================== 文本高亮 ======================
 
@@ -638,19 +753,123 @@ class Application(tk.Tk):
             filetypes=SUPPORTED_FORMATS
         )
         if txt_file:
-            self.file_path.set(txt_file)
-            file_dir = os.path.dirname(txt_file)
-            self.output_dir.set(file_dir)
-            self.status_var.set(f"已选择文件: {pathlib.Path(txt_file).name}")
+            self.load_file(txt_file)
+
+    def load_file(self, file_path):
+        """执行加载文件的具体逻辑（包含缓存和异步处理）"""
+        if not file_path or not os.path.exists(file_path):
+            return
+
+        self.file_path.set(file_path)
+        file_dir = os.path.dirname(file_path)
+        self.output_dir.set(file_dir)
+        self.status_var.set(f"正在加载文件: {pathlib.Path(file_path).name}，请稍候...")
+        
+        # 禁用相关按钮防止重复点击
+        self.btn_play.state(['disabled'])
+        self.btn_convert.state(['disabled'])
+
+        chunk_size = self.chunk_size_var.get()
+        
+        def _load_task():
             try:
-                content = read_book_file(txt_file)
-                self.text_preview.delete(1.0, tk.END)
-                self.text_preview.insert(tk.END, content)
-                self.text_preview.edit_modified(False)
-                # 加载历史记录
-                self._update_history_hint(txt_file)
+                file_hash = get_file_hash(file_path)
+                text_cache_path = os.path.join(CACHE_DIR, f"{file_hash}_text.txt")
+                meta_cache_path = os.path.join(CACHE_DIR, f"{file_hash}_meta.json")
+                
+                use_cache = False
+                if os.path.exists(text_cache_path) and os.path.exists(meta_cache_path):
+                    try:
+                        with open(meta_cache_path, 'r', encoding='utf-8') as f:
+                            meta = json.load(f)
+                        if meta.get('chunk_size') == chunk_size:
+                            use_cache = True
+                    except Exception:
+                        pass
+                
+                if use_cache:
+                    with open(text_cache_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    chapters = meta.get('chapters')
+                    chunks = meta.get('chunks')
+                    chunk_positions = meta.get('chunk_positions')
+                    
+                    self.after(0, lambda: self._show_content(file_path, content, chapters))
+                    self.after(0, lambda: self._on_chunks_ready(file_path, chunks, chunk_positions, chunk_size, True))
+                else:
+                    self.after(0, lambda: self.status_var.set(f"首次加载或设置已变，正在解析全书结构..."))
+                    content, chapters = read_book_file(file_path)
+                    
+                    # 立即显示文本内容和章节
+                    self.after(0, lambda: self._show_content(file_path, content, chapters))
+                    self.after(0, lambda: self.status_var.set(f"解析完成，正在预处理断句，稍候即可极速播放..."))
+                    
+                    chunks = split_text_to_chunks(content, chunk_size)
+                    chunk_positions = find_chunk_positions(content, chunks)
+                    
+                    # 写入缓存
+                    try:
+                        with open(text_cache_path, 'w', encoding='utf-8') as f:
+                            f.write(content)
+                        with open(meta_cache_path, 'w', encoding='utf-8') as f:
+                            json.dump({
+                                'chunk_size': chunk_size,
+                                'chapters': chapters,
+                                'chunks': chunks,
+                                'chunk_positions': chunk_positions
+                            }, f, ensure_ascii=False)
+                    except Exception as e:
+                        print(f"Warning: Failed to write cache: {e}")
+
+                    self.after(0, lambda: self._on_chunks_ready(file_path, chunks, chunk_positions, chunk_size, False))
             except Exception as e:
-                messagebox.showwarning("警告", f"无法读取文件内容: {str(e)}")
+                self.after(0, lambda: self._on_file_load_error(str(e)))
+                
+        threading.Thread(target=_load_task, daemon=True).start()
+
+    def _show_content(self, file_path, content, chapters):
+        """立即显示文本内容和章节结构"""
+        self.text_preview.delete(1.0, tk.END)
+        self.text_preview.insert(tk.END, content)
+        self.text_preview.edit_modified(False)
+        
+        # 加载章节信息
+        self.chapters = chapters or []
+        if self.chapters:
+            display_names = [f"{c[0]}" for c in self.chapters]
+            self.chapter_combo['values'] = display_names
+            self.chapter_combo.set("--- 选择章节 ---")
+            self.chapter_frame.pack(fill=tk.X, pady=(0, 5))
+        else:
+            self.chapter_frame.pack_forget()
+
+        # 加载历史记录并同步 UI，如果是恢复上次播放位置，会触发这里
+        self._update_history_hint(file_path)
+        
+        # 保存为最后打开的文件
+        history = self._load_all_history()
+        history['__LAST_FILE__'] = os.path.abspath(file_path)
+        self._save_all_history(history)
+
+    def _on_chunks_ready(self, file_path, chunks, chunk_positions, chunk_size, from_cache):
+        """后台断句完成，解除按钮禁用"""
+        self._cached_chunks = chunks
+        self._chunk_positions = chunk_positions
+        self._cached_chunk_size = chunk_size
+        
+        status_msg = f"已加载文件: {pathlib.Path(file_path).name} (极速模式就绪)"
+        if not from_cache:
+            status_msg = f"断句预处理完成！(极速模式就绪)"
+            
+        self.status_var.set(status_msg)
+        self.btn_play.state(['!disabled'])
+        self.btn_convert.state(['!disabled'])
+        
+    def _on_file_load_error(self, err_msg):
+        self.status_var.set(f"加载失败: {err_msg}")
+        messagebox.showwarning("警告", f"无法读取文件内容: {err_msg}")
+        self.btn_play.state(['!disabled'])
+        self.btn_convert.state(['!disabled'])
 
     def select_output_dir(self):
         current_file = self.file_path.get()
@@ -682,6 +901,32 @@ class Application(tk.Tk):
                     self.status_var.set(f"自动保存失败: {str(e)}")
             self.text_preview.edit_modified(False)
 
+    def on_chapter_selected(self, event):
+        """跳转到选定的章节"""
+        idx = self.chapter_combo.current()
+        if 0 <= idx < len(self.chapters):
+            title, offset = self.chapters[idx]
+            # 计算 tkinter text 的索引
+            tk_index = f"1.0 + {offset}c"
+            self.text_preview.see(tk_index)
+            # 视觉反馈
+            self._clear_highlight()
+            
+            # 更新起始片段编号
+            # 如果已经生成了 chunks，尝试找到最近的 chunk
+            if self._chunk_positions:
+                found = False
+                for i, (start, end) in enumerate(self._chunk_positions):
+                    if start >= offset:
+                        self.start_chunk_var.set(i + 1)
+                        self.status_var.set(f"跳转到章节: {title} (第 {i+1} 片段)")
+                        found = True
+                        break
+                if not found:
+                    self.start_chunk_var.set(len(self._chunk_positions))
+            else:
+                self.status_var.set(f"已选择章节: {title}，点击播放开始更新片段")
+
     # ====================== 流式播放 ======================
 
     def start_playback(self):
@@ -695,13 +940,22 @@ class Application(tk.Tk):
             self.stop_playback()
 
         max_len = self.chunk_size_var.get()
-        chunks = split_text_to_chunks(text, max_len)
-        if not chunks:
-            messagebox.showwarning("警告", "文本断句后为空!")
-            return
-
-        # 计算 chunk 在原文中的位置（用于高亮）
-        self._chunk_positions = find_chunk_positions(text, chunks)
+        
+        # 尝试使用缓存的 chunks
+        if self._cached_chunks and self._cached_chunk_size == max_len:
+            chunks = self._cached_chunks
+            self._chunk_positions = self._chunk_positions
+        else:
+            self.status_var.set("正在重新断句，请稍候...")
+            self.update()
+            chunks = split_text_to_chunks(text, max_len)
+            if not chunks:
+                messagebox.showwarning("警告", "文本断句后为空!")
+                return
+            # 计算 chunk 在原文中的位置（用于高亮）
+            self._chunk_positions = find_chunk_positions(text, chunks)
+            self._cached_chunks = chunks
+            self._cached_chunk_size = max_len
 
         # 获取起始片段（1-based → 0-based）
         start_index = max(0, self.start_chunk_var.get() - 1)
@@ -723,6 +977,7 @@ class Application(tk.Tk):
         # 更新 UI 状态
         self.btn_play.state(['disabled'])
         self.btn_stop.state(['!disabled'])
+        self.btn_pause.state(['!disabled'])
         self.btn_convert.state(['disabled'])
         self.play_status_var.set(f"准备播放... 从第{start_index + 1}片段开始，共{total}片段")
         self.status_var.set(f"流式播放中 — 共 {total} 个片段")
@@ -737,6 +992,38 @@ class Application(tk.Tk):
             daemon=True
         )
         self._playback_thread.start()
+
+    def toggle_pause(self):
+        """暂停或继续播放"""
+        if not self._is_playing:
+            return
+        if self._is_paused:
+            pygame.mixer.music.unpause()
+            self._is_paused = False
+            self.btn_pause.configure(text="⏸ 暂停")
+            self.status_var.set("已恢复播放")
+        else:
+            pygame.mixer.music.pause()
+            self._is_paused = True
+            self.btn_pause.configure(text="▶ 继续")
+            self.status_var.set("已暂停")
+
+    def on_start_chunk_changed(self, *args):
+        """当用户手动修改片段编号时，同步更新上方章节列表"""
+        try:
+            chunk_idx = self.start_chunk_var.get() - 1
+            if chunk_idx >= 0 and getattr(self, '_chunk_positions', None) and getattr(self, 'chapters', None):
+                offset = self._chunk_positions[chunk_idx][0]
+                target_chapter_idx = 0
+                # 从后往前找，第一个偏移量小于等于当前 chunk 偏移量的章节
+                for i in range(len(self.chapters) - 1, -1, -1):
+                    if offset >= self.chapters[i][1]:
+                        target_chapter_idx = i
+                        break
+                if self.chapter_combo.current() != target_chapter_idx:
+                    self.chapter_combo.current(target_chapter_idx)
+        except Exception:
+            pass
 
     def stop_playback(self):
         """停止播放并清理"""
@@ -762,6 +1049,7 @@ class Application(tk.Tk):
 
         self._cleanup_temp_dir()
         self._is_playing = False
+        self._is_paused = False
 
         # 清除高亮、恢复 UI
         self.after(0, self._clear_highlight)
@@ -770,6 +1058,8 @@ class Application(tk.Tk):
     def _reset_play_ui(self):
         self.btn_play.state(['!disabled'])
         self.btn_stop.state(['disabled'])
+        self.btn_pause.state(['disabled'])
+        self.btn_pause.configure(text="⏸ 暂停")
         self.btn_convert.state(['!disabled'])
         self.play_status_var.set("")
 
@@ -836,7 +1126,7 @@ class Application(tk.Tk):
                     pygame.mixer.music.load(current_path)
                     pygame.mixer.music.play()
 
-                    while pygame.mixer.music.get_busy():
+                    while pygame.mixer.music.get_busy() or getattr(self, '_is_paused', False):
                         if self._playback_stop.is_set():
                             pygame.mixer.music.stop()
                             return
@@ -845,9 +1135,9 @@ class Application(tk.Tk):
                     self.after(0, lambda err=str(e): self.status_var.set(f"播放出错: {err}"))
                     return
 
-                # 播完一个 chunk，保存进度
+                # 播完一个 chunk，保存进度 (在主线程执行)
                 if file_path:
-                    self._save_playback_position(file_path, i, total)
+                    self.after(0, lambda fp=file_path, idx=i, tot=total: self._save_playback_position(fp, idx, tot))
 
                 # 删除已播放的临时文件
                 try:
@@ -921,7 +1211,8 @@ class Application(tk.Tk):
                 output_path = pathlib.Path(output_dir) / output_name
 
                 loop = asyncio.new_event_loop()
-                communicate = edge_tts.Communicate(text, voice, rate=rate, volume=volume)
+                text_to_convert, _ = read_book_file(self.file_path.get())
+                communicate = edge_tts.Communicate(text_to_convert, voice, rate=rate, volume=volume)
                 loop.run_until_complete(communicate.save(str(output_path)))
                 loop.close()
 
@@ -968,7 +1259,8 @@ class Application(tk.Tk):
                     if not file_path:
                         continue
                     try:
-                        text = read_book_file(file_path).strip()
+                        text, _ = read_book_file(file_path)
+                        text = text.strip()
                         if not text:
                             continue
 
