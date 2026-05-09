@@ -114,9 +114,11 @@ def read_book_file(file_path):
                 title_tag = soup.find('title')
             
             title_text = title_tag.get_text().strip() if title_tag else ""
-            # 过滤掉一些无意义的标题，使用正文前15个字截取兜底
+            # 过滤掉一些无意义的标题，使用正文前40个字截取兜底，并清理多余空格
             if not title_text or len(title_text) > 100 or title_text.lower().startswith('unknown'):
-                title_text = item_text[:15].replace('\n', ' ') + "..."
+                import re
+                clean_text = re.sub(r'\s+', ' ', item_text[:100]).strip()
+                title_text = clean_text[:40] + "..."
             
             chapters.append((title_text, current_pos))
             texts.append(item_text)
@@ -329,19 +331,6 @@ class Application(tk.Tk):
         main_frame = ttk.Frame(self, padding=20)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        title_frame = tk.Frame(main_frame, bd=0, highlightthickness=0, bg=self.cget('bg'))
-        title_frame.pack(fill=tk.X, pady=(0, 20))
-        title_label = tk.Label(
-            title_frame,
-            text="文本转语音转换器",
-            font=('微软雅黑', 16, 'bold'),
-            bg=self.cget('bg')
-        )
-        title_label.pack(side=tk.LEFT)
-
-        help_btn = ttk.Button(title_frame, text="帮助", command=self.show_help, width=8)
-        help_btn.pack(side=tk.RIGHT, padx=(10, 0))
-
         pw = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
         pw.pack(fill=tk.BOTH, expand=True)
 
@@ -360,12 +349,23 @@ class Application(tk.Tk):
         status_frame.pack(fill=tk.X, pady=(10, 0))
         status_label = ttk.Label(status_frame, textvariable=self.status_var, foreground='#666')
         status_label.pack(side=tk.LEFT)
+        
+        help_btn = ttk.Button(status_frame, text="?", command=self.show_help, width=2, style='Small.TButton')
+        help_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        
         version_label = ttk.Label(status_frame, text="edge-tts · EdgeTTSPlayer", foreground='#999')
         version_label.pack(side=tk.RIGHT)
 
     def update_display_vars(self, *args):
+        self._current_rate_str = self.get_rate_string()
+        self._current_volume_str = self.get_volume_string()
+        
         self.display_rate_var.set(f"{self.rate_var.get():.2f}")
         self.display_volume_var.set(f"{self.volume_var.get():.2f}")
+        try:
+            pygame.mixer.music.set_volume(self.volume_var.get() / 100.0)
+        except Exception:
+            pass
 
     def create_left_panel(self, parent):
         file_frame = ttk.LabelFrame(parent, text="文本文件", padding=10)
@@ -587,12 +587,14 @@ class Application(tk.Tk):
     def _update_voice_ui(self, display_names):
         self.voice_combo['values'] = display_names
         for i, v in enumerate(self.voices):
-            if v["ShortName"] == DEFAULT_VOICE:
+            if v["ShortName"] == getattr(self, '_current_voice_name', DEFAULT_VOICE):
                 self.voice_combo.current(i)
                 break
         else:
             if display_names:
                 self.voice_combo.current(0)
+        self._current_voice_name = self.get_selected_voice()
+        self.voice_combo.bind("<<ComboboxSelected>>", lambda e: setattr(self, '_current_voice_name', self.get_selected_voice()))
         self.status_var.set(f"准备就绪 — 已加载 {len(display_names)} 个中文语音")
 
     def get_selected_voice(self):
@@ -653,6 +655,7 @@ class Application(tk.Tk):
         settings = history.get('__GLOBAL_SETTINGS__')
         if settings:
             voice_val = settings.get('voice', DEFAULT_VOICE)
+            self._current_voice_name = voice_val
             # Ensure voice exists in combo values
             if voice_val in self.voice_combo['values']:
                 self.voice_combo.set(voice_val)
@@ -696,6 +699,13 @@ class Application(tk.Tk):
             ts = info.get('timestamp', '')
             self.history_hint_var.set(f"📌 上次播放到 第{ci}/{total}片段  ({ts})")
             self.start_chunk_var.set(ci)  # 自动设置起始位置
+            
+            # 恢复章节下拉框位置
+            chapter_idx = info.get('chapter_index')
+            if chapter_idx is not None and getattr(self, 'chapters', None):
+                if 0 <= chapter_idx < len(self.chapters):
+                    self.chapter_combo.current(chapter_idx)
+                    
             self.btn_resume.state(['!disabled'])
         else:
             self.history_hint_var.set("")
@@ -1099,9 +1109,14 @@ class Application(tk.Tk):
 
                     def _gen_next(idx=i + 1, path=next_path):
                         try:
+                            # 动态读取最新的语速和音量
+                            dyn_voice = getattr(self, '_current_voice_name', voice)
+                            dyn_rate = getattr(self, '_current_rate_str', rate)
+                            dyn_volume = getattr(self, '_current_volume_str', volume)
+                            
                             gen_loop = asyncio.new_event_loop()
                             gen_loop.run_until_complete(
-                                self._generate_chunk_audio(chunks[idx], path, voice, rate, volume)
+                                self._generate_chunk_audio(chunks[idx], path, dyn_voice, dyn_rate, dyn_volume)
                             )
                             gen_loop.close()
                         except Exception as e:
